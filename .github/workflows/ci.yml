@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # macOS 15 image ships the macOS 15 SDK (Package.swift requires .macOS("15.0"))
+    # and Xcode 16 / Swift 6, matching swift-tools-version: 6.0. Native arm64.
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      # Un-skip the real-Keychain tests in ConnectionStoreTests. They are gated
+      # behind this var so local/dev runs don't touch the developer's keychain.
+      MIMIC_KEYCHAIN_TEST: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Provision an unlocked keychain for SecItem tests
+        # KeychainSecretStore uses the file-based keychain (kSecClassGenericPassword,
+        # no data-protection / access-group entitlement), so it writes to whatever
+        # keychain is default. The runner's login keychain can be locked in CI,
+        # yielding errSecInteractionNotAllowed (-25308). Provisioning a dedicated,
+        # unlocked, no-timeout keychain and making it default keeps those tests
+        # deterministic without needing any code signing or entitlements.
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/mimic-ci.keychain-db"
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings "$KEYCHAIN"        # disable auto-lock timeout
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" "login.keychain-db"
+
+      - name: Build (including tests)
+        run: swift build --build-tests
+
+      - name: Test
+        run: swift test --skip-build
