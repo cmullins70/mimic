@@ -13,13 +13,13 @@ public enum SecretStoreError: Error, Equatable, Sendable {
 public protocol SecretStore: Sendable {
     /// Upserts the secret for `(connectionID, kind)`.
     ///
-    /// Callers must serialize writes per `connectionID` (e.g. via an actor or a
-    /// per-ID queue upstream). The keychain-backed store upserts by
-    /// delete-then-add, which is not atomic: concurrent writers for the same
-    /// (id, kind) can interleave. `KeychainSecretStore` retries once on an
-    /// `errSecDuplicateItem` race so an incidental collision resolves to
-    /// last-writer-wins rather than throwing, but it does not otherwise guard
-    /// ordering — serialize upstream for a well-defined result.
+    /// Concurrent calls for the same `(connectionID, kind)` are safe: the
+    /// implementations converge to last-writer-wins without throwing
+    /// (`InMemorySecretStore` via a lock, `KeychainSecretStore` via keychain
+    /// add-or-update). The store does not, however, define *which* concurrent
+    /// writer wins — serialize per `connectionID` upstream (e.g. via an actor or
+    /// a per-ID queue) if you need a deterministic result, and note that a write
+    /// racing `deleteSecrets(for:)` for the same id is still order-dependent.
     func setSecret(_ value: String, kind: SecretKind, for connectionID: UUID) throws
     func secret(kind: SecretKind, for connectionID: UUID) throws -> String?
     func deleteSecrets(for connectionID: UUID) throws
@@ -56,31 +56,39 @@ public struct KeychainSecretStore: SecretStore {
          kSecAttrAccount as String: "\(id.uuidString)/\(kind.rawValue)"]
     }
 
-    /// Upserts by delete-then-add. Not atomic: two concurrent setSecret calls for
-    /// the same (id, kind) can race, with one SecItemAdd failing as
-    /// errSecDuplicateItem. We retry that one case once — delete-then-add again —
-    /// so an incidental race resolves to last-writer-wins instead of surfacing
-    /// OSStatus -25299. Callers must still serialize writes per connection for a
-    /// well-defined ordering (see the SecretStore protocol).
+    /// Upserts via add-or-update: try SecItemAdd, and on errSecDuplicateItem fall
+    /// back to SecItemUpdate of just the value data. Unlike delete-then-add this
+    /// never removes the item, so there is no window where the secret momentarily
+    /// disappears — the FSKit extension may be reading it cross-process — and
+    /// concurrent setSecret calls for the same (id, kind) converge to
+    /// last-writer-wins without any of them surfacing errSecDuplicateItem
+    /// (OSStatus -25299). A delete-then-add + single retry does NOT hold under
+    /// contention: a 200-way concurrent stress test still failed ~160/200, since
+    /// the retried add races the same way (see SecretStoreTests).
     public func setSecret(_ value: String, kind: SecretKind, for id: UUID) throws {
-        do {
-            try upsert(value, kind: kind, for: id)
-        } catch SecretStoreError.keychain(let status) where status == errSecDuplicateItem {
-            try upsert(value, kind: kind, for: id)
-        }
-    }
-
-    private func upsert(_ value: String, kind: SecretKind, for id: UUID) throws {
-        var q = query(kind, id)
-        SecItemDelete(q as CFDictionary)  // upsert: ignore result
-        q[kSecValueData as String] = Data(value.utf8)
+        let data = Data(value.utf8)
+        var attrs = query(kind, id)
+        attrs[kSecValueData as String] = data
         // AfterFirstUnlock (not WhenUnlocked): the FSKit extension may need to
         // read SSH credentials to remount headless/at boot or while the screen
         // is locked. Trade-off: secrets remain readable after the first unlock
         // post-boot until shutdown — acceptable for a background mount daemon.
-        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        let status = SecItemAdd(q as CFDictionary, nil)
-        guard status == errSecSuccess else { throw SecretStoreError.keychain(status) }
+        // Only applied on insert; SecItemUpdate below leaves accessibility as-is,
+        // which is fine because every insert uses this same value.
+        attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+
+        let addStatus = SecItemAdd(attrs as CFDictionary, nil)
+        switch addStatus {
+        case errSecSuccess:
+            return
+        case errSecDuplicateItem:
+            let updateStatus = SecItemUpdate(
+                query(kind, id) as CFDictionary,
+                [kSecValueData as String: data] as CFDictionary)
+            guard updateStatus == errSecSuccess else { throw SecretStoreError.keychain(updateStatus) }
+        default:
+            throw SecretStoreError.keychain(addStatus)
+        }
     }
 
     public func secret(kind: SecretKind, for id: UUID) throws -> String? {
