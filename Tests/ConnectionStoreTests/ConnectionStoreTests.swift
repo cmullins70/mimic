@@ -32,6 +32,28 @@ private func tempDir() throws -> URL {
     #expect(try store.all().isEmpty)
 }
 
+@Test func corruptFileThrowsInsteadOfSilentlyEmptying() throws {
+    let dir = try tempDir()
+    let file = dir.appendingPathComponent("connections.json")
+    let garbage = Data("not json {{{".utf8)
+    try garbage.write(to: file)
+
+    let store = ConnectionStore(directory: dir)
+    #expect(throws: ConnectionStoreError.self) { try store.all() }
+
+    // save() must also refuse — a write must never clobber a corrupted store.
+    let c = ConnectionConfig(id: UUID(), name: "x", host: "h", port: 22,
+                             username: "u", auth: .password, remotePath: "/", volumeName: "X")
+    #expect(throws: ConnectionStoreError.self) { try store.save(c) }
+    // Corrupt bytes are still on disk, untouched.
+    #expect(try Data(contentsOf: file) == garbage)
+}
+
+@Test func missingFileIsJustEmpty() throws {
+    let store = ConnectionStore(directory: try tempDir())
+    #expect(try store.all().isEmpty)
+}
+
 @Test func configFilePermissionsAreOwnerOnly() throws {
     let dir = try tempDir()
     let store = ConnectionStore(directory: dir)
