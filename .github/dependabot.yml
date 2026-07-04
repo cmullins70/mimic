@@ -21,5 +21,9 @@ updates:
       prefix: "chore"
     # SECURITY: Citadel is pinned exact 0.12.0 on purpose — 0.12.1 silently
     # swapped its swift-nio-ssh dependency to an unvetted personal fork via an
-    # unreviewed PR (see Package.swift). Do NOT auto-merge a Citadel bump:
-    # review the PR's transitive dependency URLs before merging.
+    # unreviewed PR (see Package.swift). Dependabot cannot review transitive
+    # dependency URLs, so it must not auto-propose Citadel bumps; evaluate any
+    # new Citadel release manually. (GitHub security advisories are unaffected
+    # by this ignore and still surface separately.)
+    ignore:
+      - dependency-name: "github.com/orlandos-nl/citadel"
