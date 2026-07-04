@@ -52,6 +52,36 @@ import Foundation
     }
 }
 
+@Test func writePastEOFZeroFillsGap() async throws {
+    let fs = InMemoryFS()
+    let p = try RemotePath("/gap")
+    try await fs.createFile(at: p)
+    try await fs.write(file: p, offset: 5, data: Data("xy".utf8))
+    let d = try await fs.read(file: p, offset: 0, length: 100)
+    #expect(d == Data(repeating: 0, count: 5) + Data("xy".utf8))
+    #expect(try await fs.attributes(at: p).size == 7)
+}
+
+@Test func errorPathsForWriteReadTruncate() async throws {
+    let fs = InMemoryFS()
+    let missing = try RemotePath("/missing")
+    let dir = try RemotePath("/dir")
+    try await fs.createDirectory(at: dir)
+
+    await #expect(throws: RemoteFSError.notFound(missing)) {
+        try await fs.write(file: missing, offset: 0, data: Data("x".utf8))
+    }
+    await #expect(throws: RemoteFSError.isADirectory(dir)) {
+        try await fs.write(file: dir, offset: 0, data: Data("x".utf8))
+    }
+    await #expect(throws: RemoteFSError.notFound(missing)) {
+        _ = try await fs.read(file: missing, offset: 0, length: 1)
+    }
+    await #expect(throws: RemoteFSError.notFound(missing)) {
+        try await fs.truncate(file: missing, to: 0)
+    }
+}
+
 @Test func truncateShrinksAndGrows() async throws {
     let fs = InMemoryFS()
     let p = try RemotePath("/f")

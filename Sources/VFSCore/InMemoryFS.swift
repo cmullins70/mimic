@@ -22,8 +22,8 @@ public actor InMemoryFS: RemoteFS {
         guard case .directory = try node(parent) else { throw RemoteFSError.notADirectory(parent) }
     }
 
-    public func attributes(at path: RemotePath) async throws -> FileAttributes {
-        switch try node(path) {
+    private func attributes(for node: Node) -> FileAttributes {
+        switch node {
         case .file(let d, let m):
             FileAttributes(type: .file, size: UInt64(d.count), modified: m, permissions: 0o644)
         case .directory(let m):
@@ -31,13 +31,17 @@ public actor InMemoryFS: RemoteFS {
         }
     }
 
+    public func attributes(at path: RemotePath) async throws -> FileAttributes {
+        attributes(for: try node(path))
+    }
+
     public func list(directory: RemotePath) async throws -> [DirEntry] {
         guard case .directory = try node(directory) else {
             throw RemoteFSError.notADirectory(directory)
         }
         var out: [DirEntry] = []
-        for (p, _) in nodes where p.parent == directory {
-            out.append(DirEntry(name: p.name, attributes: try await attributes(at: p)))
+        for (p, n) in nodes where p.parent == directory {
+            out.append(DirEntry(name: p.name, attributes: attributes(for: n)))
         }
         return out.sorted { $0.name < $1.name }
     }
