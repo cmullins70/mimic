@@ -47,10 +47,18 @@ public struct KeychainSecretStore: SecretStore {
          kSecAttrAccount as String: "\(id.uuidString)/\(kind.rawValue)"]
     }
 
+    /// Upserts by delete-then-add. Not atomic: two concurrent setSecret calls for
+    /// the same (id, kind) can race, with one failing as errSecDuplicateItem
+    /// (surfaced as SecretStoreError.keychain). Callers serialize writes per
+    /// connection, so this is not hit in practice.
     public func setSecret(_ value: String, kind: SecretKind, for id: UUID) throws {
         var q = query(kind, id)
         SecItemDelete(q as CFDictionary)  // upsert: ignore result
         q[kSecValueData as String] = Data(value.utf8)
+        // AfterFirstUnlock (not WhenUnlocked): the FSKit extension may need to
+        // read SSH credentials to remount headless/at boot or while the screen
+        // is locked. Trade-off: secrets remain readable after the first unlock
+        // post-boot until shutdown — acceptable for a background mount daemon.
         q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         let status = SecItemAdd(q as CFDictionary, nil)
         guard status == errSecSuccess else { throw SecretStoreError.keychain(status) }
