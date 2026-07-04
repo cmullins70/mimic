@@ -20,6 +20,11 @@ import Foundation
     #expect(try store.secret(kind: .keyPassphrase, for: id) == "phrase")
 }
 
+// TODO(ci): This test hits the real macOS Keychain and is skipped unless
+// MIMIC_KEYCHAIN_TEST=1 is set. When a CI workflow is added (macOS runner),
+// set MIMIC_KEYCHAIN_TEST=1 in its env so this path is actually exercised
+// rather than perpetually skipped. macOS runners have an unlocked login
+// keychain by default, so no extra entitlements should be needed — verify.
 @Test(.enabled(if: ProcessInfo.processInfo.environment["MIMIC_KEYCHAIN_TEST"] == "1"))
 func keychainRoundtrip() throws {
     let store = KeychainSecretStore(service: "io.mimic.test")

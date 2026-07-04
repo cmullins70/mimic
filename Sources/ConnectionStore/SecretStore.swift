@@ -11,6 +11,15 @@ public enum SecretStoreError: Error, Equatable, Sendable {
 }
 
 public protocol SecretStore: Sendable {
+    /// Upserts the secret for `(connectionID, kind)`.
+    ///
+    /// Callers must serialize writes per `connectionID` (e.g. via an actor or a
+    /// per-ID queue upstream). The keychain-backed store upserts by
+    /// delete-then-add, which is not atomic: concurrent writers for the same
+    /// (id, kind) can interleave. `KeychainSecretStore` retries once on an
+    /// `errSecDuplicateItem` race so an incidental collision resolves to
+    /// last-writer-wins rather than throwing, but it does not otherwise guard
+    /// ordering — serialize upstream for a well-defined result.
     func setSecret(_ value: String, kind: SecretKind, for connectionID: UUID) throws
     func secret(kind: SecretKind, for connectionID: UUID) throws -> String?
     func deleteSecrets(for connectionID: UUID) throws
@@ -48,10 +57,20 @@ public struct KeychainSecretStore: SecretStore {
     }
 
     /// Upserts by delete-then-add. Not atomic: two concurrent setSecret calls for
-    /// the same (id, kind) can race, with one failing as errSecDuplicateItem
-    /// (surfaced as SecretStoreError.keychain). Callers serialize writes per
-    /// connection, so this is not hit in practice.
+    /// the same (id, kind) can race, with one SecItemAdd failing as
+    /// errSecDuplicateItem. We retry that one case once — delete-then-add again —
+    /// so an incidental race resolves to last-writer-wins instead of surfacing
+    /// OSStatus -25299. Callers must still serialize writes per connection for a
+    /// well-defined ordering (see the SecretStore protocol).
     public func setSecret(_ value: String, kind: SecretKind, for id: UUID) throws {
+        do {
+            try upsert(value, kind: kind, for: id)
+        } catch SecretStoreError.keychain(let status) where status == errSecDuplicateItem {
+            try upsert(value, kind: kind, for: id)
+        }
+    }
+
+    private func upsert(_ value: String, kind: SecretKind, for id: UUID) throws {
         var q = query(kind, id)
         SecItemDelete(q as CFDictionary)  // upsert: ignore result
         q[kSecValueData as String] = Data(value.utf8)

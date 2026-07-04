@@ -1455,6 +1455,7 @@ public struct KeychainSecretStore: SecretStore {
 
 - [ ] **Step 4: Run unit tests** — `swift test --filter SecretStoreTests` → PASS (keychain test skipped).
 - [ ] **Step 5: Run keychain smoke test once locally** — `MIMIC_KEYCHAIN_TEST=1 swift test --filter keychainRoundtrip` → PASS (may show a keychain prompt; approve it).
+- [ ] **CI follow-up (when a workflow is added):** set `MIMIC_KEYCHAIN_TEST=1` in the macOS CI job env so `keychainRoundtrip` runs in CI instead of being perpetually skipped. macOS GitHub Actions runners have an unlocked login keychain by default (no extra entitlements expected) — verify when the workflow lands.
 - [ ] **Step 6: Commit** — `git commit -am "feat(connections): SecretStore protocol with Keychain and in-memory impls"`
 
 ---
