@@ -17,7 +17,7 @@ let package = Package(
         // 0.12.0 is the last release pulling from the Citadel maintainer's own fork.
         // Do not bump without reviewing Citadel's dependency URLs. See task #15 /
         // spec §7 risk 5 before changing.
-        .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.12.0"),
+        .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.12.1"),
     ],
     targets: [
         .target(name: "VFSCore"),
