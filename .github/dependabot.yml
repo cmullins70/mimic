@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Keep the SHA-pinned actions in ci.yml current. Dependabot bumps the pin and
+  # the trailing "# vX.Y.Z" comment together, so pinning stays maintainable.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Swift Package Manager dependencies (Package.swift / Package.resolved).
+  - package-ecosystem: "swift"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+    # SECURITY: Citadel is pinned exact 0.12.0 on purpose — 0.12.1 silently
+    # swapped its swift-nio-ssh dependency to an unvetted personal fork via an
+    # unreviewed PR (see Package.swift). Do NOT auto-merge a Citadel bump:
+    # review the PR's transitive dependency URLs before merging.

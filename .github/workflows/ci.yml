@@ -25,10 +25,22 @@ jobs:
       MIMIC_KEYCHAIN_TEST: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Show Swift version
         run: swift --version
+
+      - name: Cache SwiftPM build
+        # Caches compiled dependencies (Citadel + swift-nio-ssh are the slow part)
+        # keyed on Package.resolved, so a lockfile change invalidates it. The
+        # restore-keys prefix lets an unrelated source change still reuse the
+        # dependency build products via incremental compilation.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
 
       - name: Provision an unlocked keychain for SecItem tests
         # KeychainSecretStore uses the file-based keychain (kSecClassGenericPassword,
