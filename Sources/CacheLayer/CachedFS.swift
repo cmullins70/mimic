@@ -3,12 +3,15 @@ import VFSCore
 
 /// RemoteFS decorator adding a chunked read cache + TTL metadata cache.
 /// Mutations pass through to the backend, then invalidate.
-public final class CachedFS: RemoteFS, @unchecked Sendable {
+public final class CachedFS: RemoteFS, Sendable {
     private let backend: any RemoteFS
     private let connectionID: String
     private let chunks: ChunkCache
     private let meta: MetadataCache
 
+    /// - Parameter metadataCache: must be exclusive to this connection. Its keys
+    ///   are bare RemotePaths with no connectionID (unlike ChunkKey), so sharing
+    ///   one instance across connections would cross-contaminate metadata.
     public init(backend: any RemoteFS, connectionID: String,
                 chunkCache: ChunkCache, metadataCache: MetadataCache) {
         self.backend = backend
@@ -31,13 +34,22 @@ public final class CachedFS: RemoteFS, @unchecked Sendable {
         let entries = try await backend.list(directory: directory)
         meta.setListing(entries, for: directory)
         for e in entries {  // listings give us attrs for free — warm them
+            // Entry names are SERVER-CONTROLLED and `appending` skips validation:
+            // "a/b" would poison the attrs cache for a path in a different
+            // directory; ".."/"."/"" would violate RemotePath's invariants.
+            // Skip hostile names; the entry is still returned as listing data.
+            if e.name.isEmpty || e.name == "." || e.name == ".." || e.name.contains("/") { continue }
             meta.setAttributes(e.attributes, for: directory.appending(e.name))
         }
         return entries
     }
 
     public func read(file: RemotePath, offset: UInt64, length: Int) async throws -> Data {
+        guard length > 0 else { return Data() }  // negative length would trap in UInt64 conversion
         let attrs = try await attributes(at: file)
+        // NOTE: SFTP mtime granularity is 1 second — two same-size writes within
+        // the same second collide stamps and can serve stale chunks. Known v1
+        // contract; backend authors beware.
         let stamp = "\(attrs.size)-\(attrs.modified.timeIntervalSince1970)"
         let key = ChunkKey(connectionID: connectionID, path: file.rawValue, contentStamp: stamp)
         let chunkSize = UInt64(ChunkCache.chunkSize)
@@ -55,7 +67,12 @@ public final class CachedFS: RemoteFS, @unchecked Sendable {
             } else {
                 let wanted = Int(min(chunkSize, attrs.size - chunkStart))
                 chunkData = try await backend.read(file: file, offset: chunkStart, length: wanted)
-                await chunks.store(chunkData, for: key, index: chunkIndex)
+                // A short read means the remote changed mid-flight: still return
+                // the data for THIS read, but don't persist it under a stamp that
+                // no longer describes the file.
+                if chunkData.count == wanted {
+                    await chunks.store(chunkData, for: key, index: chunkIndex)
+                }
             }
             let sliceStart = Int(max(offset, chunkStart) - chunkStart)
             let sliceEnd = Int(min(end, chunkStart + UInt64(chunkData.count)) - chunkStart)
