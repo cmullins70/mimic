@@ -12,7 +12,12 @@ let package = Package(
         .executable(name: "mimic-cli", targets: ["mimic-cli"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/orlandos-nl/Citadel.git", from: "0.7.0"),
+        // Pinned exact: 0.12.1 silently swapped its swift-nio-ssh dependency to an
+        // unvetted personal fork (Wellz26/swift-nio-ssh) via an unreviewed PR.
+        // 0.12.0 is the last release pulling from the Citadel maintainer's own fork.
+        // Do not bump without reviewing Citadel's dependency URLs. See task #15 /
+        // spec §7 risk 5 before changing.
+        .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.12.0"),
     ],
     targets: [
         .target(name: "VFSCore"),
