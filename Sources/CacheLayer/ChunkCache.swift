@@ -43,6 +43,8 @@ public actor ChunkCache {
         self.root = directory
         self.byteLimit = byteLimit
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Chunk files hold remote file content — owner-only access on the root.
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         // Rebuild index from disk (survives restarts); order by mtime.
         var found: [(id: String, url: URL, size: Int, mtime: Date)] = []
         let fm = FileManager.default
@@ -77,11 +79,15 @@ public actor ChunkCache {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appendingPathComponent(String(index))
         let id = entryID(key, index)
-        if let old = lru[id] {
-            totalBytes -= fileSize(at: old)
+        // Read the old size BEFORE the write, but only adjust accounting after the
+        // write succeeds — a failed write leaves the old file (and its tracking) intact.
+        let oldSize = lru[id] != nil ? fileSize(at: file) : nil
+        guard (try? data.write(to: file, options: .atomic)) != nil else { return }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        if let oldSize {
+            totalBytes -= oldSize
             order.removeAll { $0 == id }
         }
-        guard (try? data.write(to: file, options: .atomic)) != nil else { return }
         lru[id] = file
         order.append(id)
         totalBytes += data.count
@@ -102,19 +108,33 @@ public actor ChunkCache {
         for (id, url) in lru where id.hasPrefix(tag + "-") {
             let size = fileSize(at: url)
             try? FileManager.default.removeItem(at: url)
+            // Only drop tracking if the file is actually gone — a failed delete that
+            // leaves the file behind must stay accounted, or its bytes leak untracked.
+            guard !FileManager.default.fileExists(atPath: url.path) else { continue }
             totalBytes -= size
             lru[id] = nil
+            order.removeAll { $0 == id }
         }
-        order.removeAll { $0.hasPrefix(tag + "-") }
     }
 
     private func evictIfNeeded() {
-        while totalBytes > byteLimit, let victim = order.first {
+        // stuckCount = consecutive victims whose deletes failed; once it reaches the
+        // number of tracked entries every candidate is undeletable — stop, no progress.
+        var stuckCount = 0
+        while totalBytes > byteLimit, stuckCount < order.count, let victim = order.first {
             order.removeFirst()
-            if let url = lru.removeValue(forKey: victim) {
-                let size = fileSize(at: url)
-                try? FileManager.default.removeItem(at: url)
+            guard let url = lru[victim] else { continue }
+            let size = fileSize(at: url)
+            try? FileManager.default.removeItem(at: url)
+            if FileManager.default.fileExists(atPath: url.path) {
+                // Delete failed and the file remains: keep it tracked (bytes and all),
+                // move to the most-recent end so the loop doesn't spin on it.
+                order.append(victim)
+                stuckCount += 1
+            } else {
+                lru[victim] = nil
                 totalBytes -= size
+                stuckCount = 0
             }
         }
     }

@@ -39,6 +39,20 @@ private func tempDir() throws -> URL {
     #expect(await cache.fetch(for: key, index: 2) != nil)
 }
 
+@Test func chunkFilesAndRootAreOwnerOnly() async throws {
+    let dir = try tempDir()
+    let cache = try ChunkCache(directory: dir, byteLimit: 1_000_000)
+    let key = ChunkKey(connectionID: "c", path: "/f", contentStamp: "s")
+    await cache.store(Data("secret".utf8), for: key, index: 0)
+    let fm = FileManager.default
+    let rootPerms = try fm.attributesOfItem(atPath: dir.path)[.posixPermissions] as? NSNumber
+    #expect(rootPerms?.intValue == 0o700)
+    let sub = try #require(fm.contentsOfDirectory(atPath: dir.path).first)
+    let filePath = dir.appendingPathComponent(sub).appendingPathComponent("0").path
+    let filePerms = try fm.attributesOfItem(atPath: filePath)[.posixPermissions] as? NSNumber
+    #expect(filePerms?.intValue == 0o600)
+}
+
 @Test func invalidateRemovesAllChunksForPath() async throws {
     let cache = try ChunkCache(directory: try tempDir(), byteLimit: 1_000_000)
     let key = ChunkKey(connectionID: "c", path: "/f", contentStamp: "s")
