@@ -33,3 +33,20 @@ private final class Clock: @unchecked Sendable {
     cache.invalidate(try RemotePath("/d/a"))   // invalidating a child clears parent listing + child attrs
     #expect(cache.listing(for: dir) == nil)
 }
+
+@Test func exactlyAtTTLIsExpired() throws {
+    let clock = Clock(Date(timeIntervalSince1970: 1000))
+    let cache = MetadataCache(ttl: 5, now: { clock.now })
+    let p = try RemotePath("/f")
+    cache.setAttributes(FileAttributes(type: .file, size: 1, modified: .now, permissions: 0o644), for: p)
+    clock.now = clock.now.addingTimeInterval(5)
+    #expect(cache.attributes(for: p) == nil)
+}
+
+@Test func invalidatingDirectoryClearsItsOwnListing() throws {
+    let cache = MetadataCache(ttl: 5)
+    let dir = try RemotePath("/d")
+    cache.setListing([], for: dir)
+    cache.invalidate(dir)
+    #expect(cache.listing(for: dir) == nil)
+}
