@@ -12,7 +12,7 @@ A free, open-source macOS menu bar app that mounts remote storage as real Finder
 - **v1 backend:** SFTP only.
 - **Sync model:** live mount + local read cache. Writes pass through to the server. Offline means the volume is unavailable — no offline sync engine in v1.
 - **App shape:** menu bar icon (status, mount/unmount) + SwiftUI window for connection management.
-- **License/distribution:** MIT. Developer ID signed + notarized, distributed outside the App Store (GitHub releases; Homebrew cask later). No telemetry.
+- **License/distribution:** MIT. **Phase 1 (now): personal-use development builds** signed with a free Apple ID personal team — build from source in Xcode, run locally. **Phase 2 (requires paid Developer ID, deferred):** notarized GitHub releases outside the App Store; Homebrew cask later. No telemetry.
 
 ### Explicitly out of v1 (roadmap, not scope)
 
@@ -101,7 +101,7 @@ Four Swift packages shared by two thin executables:
 1. **Pioneer risk** — no OSS FSKit network FS exists to reference; undocumented behavior likely. Mitigation: fuse-t's issue tracker documents most landmines; `VFSCore` is mount-tech-agnostic, so worst case an NFS-loopback backend can be added without touching the core.
 2. **Shell-out mount friction on macOS 26** (permissions, sandbox interplay). Known-working per fuse-t/macFUSE usage; macOS 27's `mountSingleVolume` retires it (~2 months to GA).
 3. **Cache coherency pre-27:** no kernel-cache invalidation API when the server changes files externally; short metadata TTLs mitigate; adopt the macOS 27 invalidation APIs when GA.
-4. **Requires a paid Apple Developer ID** to sign the FSKit extension for distribution.
+4. **No paid Apple Developer ID yet** — v1 targets personal-use builds signed with a free personal team (works locally; free provisioning profiles expire and need periodic rebuilds). Distributing signed/notarized binaries to other users is blocked until a paid Developer ID exists. Community reports local FSKit dev-signing as finicky; budget debugging time for the first successful mount.
 5. **Citadel maturity** for heavy concurrent SFTP I/O is unproven at this scale; the `RemoteFS` seam contains the blast radius if a swap to libssh2 becomes necessary.
 
 ## 8. Success criteria for v1
