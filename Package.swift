@@ -22,6 +22,14 @@ let package = Package(
         // so SFTPBackend can name ByteBuffer/NIOCore. This is upstream swift-nio,
         // NOT the swift-nio-ssh fork the Citadel note warns about.
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.0"),
+        // The swift-nio-ssh fork Citadel already pulls (see Citadel note in this
+        // file). Direct dep — SAME url + Citadel's identical version range, so
+        // resolution is unchanged (still 0.3.5) — needed to name NIOSSHPublicKey /
+        // the host-key validator delegate for TOFU verification. Dependabot-ignored
+        // like Citadel; any bump needs the same manual supply-chain review.
+        .package(url: "https://github.com/Joannis/swift-nio-ssh.git", "0.3.4" ..< "0.4.0"),
+        // Apple's swift-crypto (already transitive) for SHA256 host-key fingerprints.
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
     ],
     targets: [
         .target(name: "VFSCore"),
@@ -30,6 +38,8 @@ let package = Package(
         .target(name: "SFTPBackend", dependencies: [
             "VFSCore", "ConnectionStore", "Citadel",
             .product(name: "NIOCore", package: "swift-nio"),
+            .product(name: "NIOSSH", package: "swift-nio-ssh"),
+            .product(name: "Crypto", package: "swift-crypto"),
         ]),
         .executableTarget(
             name: "mimic-cli",
