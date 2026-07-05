@@ -10,9 +10,9 @@ public enum SFTPAuth: Sendable {
 public enum HostKeyPolicy: Sendable {
     /// Accepts any host key. Test fixtures / throwaway localhost servers ONLY.
     case acceptAny
-    /// Trust-on-first-use backed by `HostKeyStore`. NOT yet implemented — fails
-    /// closed (see `makeHostKeyValidator`). Wiring it requires computing the
-    /// server's SHA256 fingerprint from swift-nio-ssh's `NIOSSHPublicKey`.
+    /// Trust-on-first-use backed by `HostKeyStore` (see `TOFUHostKeyValidator`).
+    /// Fails closed on an unknown or changed host key with
+    /// `RemoteFSError.hostKeyMismatch`.
     case tofu(HostKeyStore)
 }
 
@@ -59,12 +59,13 @@ public final class SFTPConnection: @unchecked Sendable {
         switch hostKeyPolicy {
         case .acceptAny:
             return .acceptAnything()
-        case .tofu:
-            // Fail closed: NEVER silently accept an unverified host key under a
-            // policy whose whole purpose is MITM protection. Real TOFU (compute
-            // SHA256 fingerprint from NIOSSHPublicKey, consult HostKeyStore) is a
-            // tracked follow-up.
-            throw RemoteFSError.unsupported("TOFU host-key verification not implemented yet")
+        case .tofu(let store):
+            // Trust-on-first-use: compute the server's SHA256 fingerprint and
+            // consult the store. Fails closed on unknown/mismatch (see
+            // TOFUHostKeyValidator). The hostKeyMismatch error propagates unwrapped
+            // through SSHClient.connect and is rethrown by connect()'s RemoteFSError
+            // catch below.
+            return .custom(TOFUHostKeyValidator(store: store, host: host, port: port))
         }
     }
 

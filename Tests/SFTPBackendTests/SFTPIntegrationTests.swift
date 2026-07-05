@@ -74,3 +74,43 @@ private func makeFS() async throws -> SFTPFileSystem {
             auth: .password("wrong"), hostKeyPolicy: .acceptAny, root: "/upload")
     }
 }
+
+// TOFU host-key verification: first contact fails closed carrying the server's
+// fingerprint (UI would prompt + trust), a trusted key connects, and a changed
+// key (MITM signal) fails with a mismatch. `SFTPIntegration` in the name so the
+// existing filter picks it up.
+@Test(.enabled(if: enabled)) func tofuHostKeySFTPIntegration() async throws {
+    let host = ProcessInfo.processInfo.environment["MIMIC_SFTP_TEST_HOST"]!
+    let storeFile = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mimic-known-hosts-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: storeFile) }
+    let store = try HostKeyStore(fileURL: storeFile)
+
+    func connectTOFU() async throws -> SFTPFileSystem {
+        try await SFTPFileSystem.connect(
+            host: host, port: 2222, username: "mimic", auth: .password("mimictest"),
+            hostKeyPolicy: .tofu(store), root: "/upload")
+    }
+
+    // 1. Unknown host key on first contact → fails closed, surfacing the actual fp.
+    let firstFingerprint: String
+    do {
+        _ = try await connectTOFU()
+        Issue.record("expected hostKeyMismatch on first (unknown) contact")
+        return
+    } catch let RemoteFSError.hostKeyMismatch(expected, actual) {
+        #expect(expected == "")                 // unknown ⇒ no prior pin
+        #expect(actual.hasPrefix("SHA256:"))
+        firstFingerprint = actual
+    }
+
+    // 2. Trust it (what the UI does after prompting) → reconnect succeeds.
+    try store.trust(host: host, port: 2222, fingerprint: firstFingerprint)
+    let fs = try await connectTOFU()
+    _ = try await fs.list(directory: .root)
+
+    // 3. Pin a different key (simulated MITM) → reconnect fails with a mismatch.
+    try store.replacePin(host: host, port: 2222,
+                         fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    await #expect(throws: RemoteFSError.self) { _ = try await connectTOFU() }
+}
