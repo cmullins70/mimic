@@ -18,12 +18,19 @@ let package = Package(
         // Do not bump without reviewing Citadel's dependency URLs. See task #15 /
         // spec §7 risk 5 before changing.
         .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.12.0"),
+        // Apple's swift-nio (already resolved transitively via Citadel). Direct dep
+        // so SFTPBackend can name ByteBuffer/NIOCore. This is upstream swift-nio,
+        // NOT the swift-nio-ssh fork the Citadel note warns about.
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.0"),
     ],
     targets: [
         .target(name: "VFSCore"),
         .target(name: "CacheLayer", dependencies: ["VFSCore"]),
         .target(name: "ConnectionStore"),
-        .target(name: "SFTPBackend", dependencies: ["VFSCore", "ConnectionStore", "Citadel"]),
+        .target(name: "SFTPBackend", dependencies: [
+            "VFSCore", "ConnectionStore", "Citadel",
+            .product(name: "NIOCore", package: "swift-nio"),
+        ]),
         .executableTarget(
             name: "mimic-cli",
             dependencies: ["VFSCore", "CacheLayer", "ConnectionStore", "SFTPBackend"]),

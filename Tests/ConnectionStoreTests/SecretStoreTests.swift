@@ -38,8 +38,15 @@ func keychainRoundtrip() throws {
 // single retry-on-duplicate) failed en masse with errSecDuplicateItem (-25299)
 // under contention — ~160-183/200. The add-or-update implementation converges
 // concurrent writers to last-writer-wins, so no call throws and the final value
-// is one of the writes. Same keychain gate as above.
-@Test(.enabled(if: ProcessInfo.processInfo.environment["MIMIC_KEYCHAIN_TEST"] == "1"))
+// is one of the writes.
+//
+// Gated behind its own MIMIC_KEYCHAIN_STRESS var, *not* MIMIC_KEYCHAIN_TEST: the
+// add-or-update path calls SecItemUpdate, which on an unentitled binary against a
+// developer login keychain raises an interactive ACL-authorization prompt that
+// blocks a headless run forever. Enable only in an environment with a dedicated,
+// unlocked keychain and a partition list that suppresses the prompt (see CI), so
+// a normal MIMIC_KEYCHAIN_TEST=1 run never hangs on the dialog.
+@Test(.enabled(if: ProcessInfo.processInfo.environment["MIMIC_KEYCHAIN_STRESS"] == "1"))
 func concurrentSetSecretForSameConnectionDoesNotRace() throws {
     let store = KeychainSecretStore(service: "io.mimic.test.concurrent")
     let id = UUID()
