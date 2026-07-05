@@ -36,15 +36,24 @@ public final class SFTPFileSystem: RemoteFS, @unchecked Sendable {
     }
 
     private func withTimeout<T: Sendable>(_ op: @escaping @Sendable () async throws -> T) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await op() }
-            group.addTask {
-                try await Task.sleep(for: self.timeout)
-                throw RemoteFSError.timeout
+        do {
+            return try await withThrowingTaskGroup(of: T.self) { group in
+                group.addTask { try await op() }
+                group.addTask {
+                    try await Task.sleep(for: self.timeout)
+                    throw RemoteFSError.timeout
+                }
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+        } catch let error as RemoteFSError where error == .timeout {
+            // Citadel/NIOSSH calls may not observe Task cancellation, so the losing
+            // op task above may still be blocked inside a wedged SFTP request. Tear
+            // the connection down so a half-wedged SFTPClient is never silently
+            // reused by the next liveSFTP(); the next op reconnects fresh.
+            await connection.invalidate()
+            throw error
         }
     }
 
