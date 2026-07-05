@@ -63,6 +63,18 @@ public final class SFTPFileSystem: RemoteFS, @unchecked Sendable {
         // as a bare SFTPMessage.Status (e.g. getAttributes) — handle both.
         if case let SFTPError.errorStatus(status) = error { return Self.mapStatus(status, path: path) }
         if let status = error as? SFTPMessage.Status { return Self.mapStatus(status, path: path) }
+        // A dropped transport surfaces as SFTPError.connectionClosed (every
+        // in-flight request promise is failed with it when the SFTP channel
+        // closes) or a NIO ChannelError on a write to a dead channel.
+        // Canonicalize both to .connectionLost so the FS layer has one error
+        // vocabulary for a dead connection instead of leaking it as .io.
+        if case SFTPError.connectionClosed = error { return RemoteFSError.connectionLost }
+        if let ce = error as? ChannelError {
+            switch ce {
+            case .ioOnClosedChannel, .alreadyClosed, .eof: return RemoteFSError.connectionLost
+            default: break
+            }
+        }
         return RemoteFSError.io(String(describing: error))
     }
 
@@ -79,7 +91,8 @@ public final class SFTPFileSystem: RemoteFS, @unchecked Sendable {
         let sp = serverPath(path)
         do {
             return try await withTimeout {
-                try await self.connection.withSFTP { sftp in
+                // Pure read → idempotent, safe to retry once on a dropped transport.
+                try await self.connection.withSFTP(retryOnDrop: true) { sftp in
                     Self.convert(try await sftp.getAttributes(at: sp))
                 }
             }
@@ -90,7 +103,8 @@ public final class SFTPFileSystem: RemoteFS, @unchecked Sendable {
         let sp = serverPath(directory)
         do {
             return try await withTimeout {
-                try await self.connection.withSFTP { sftp in
+                // Directory listing is a pure read → idempotent, safe to retry.
+                try await self.connection.withSFTP(retryOnDrop: true) { sftp in
                     let names = try await sftp.listDirectory(atPath: sp)
                     var out: [DirEntry] = []
                     for name in names {
@@ -108,7 +122,9 @@ public final class SFTPFileSystem: RemoteFS, @unchecked Sendable {
         let sp = serverPath(file)
         do {
             return try await withTimeout {
-                try await self.connection.withSFTP { sftp in
+                // Offset-addressed read → idempotent; the whole open/read/close is
+                // safe to re-run on a dropped transport.
+                try await self.connection.withSFTP(retryOnDrop: true) { sftp in
                     let handle = try await sftp.openFile(filePath: sp, flags: .read)
                     do {
                         var out = Data()
@@ -137,7 +153,10 @@ public final class SFTPFileSystem: RemoteFS, @unchecked Sendable {
         let sp = serverPath(file)
         do {
             try await withTimeout {
-                try await self.connection.withSFTP { sftp in
+                // Offset-addressed write of the same bytes → idempotent (no append,
+                // no truncate): re-running writes identical data at identical
+                // offsets, so retry-on-drop is safe.
+                try await self.connection.withSFTP(retryOnDrop: true) { sftp in
                     let handle = try await sftp.openFile(filePath: sp, flags: [.write])
                     do {
                         var at = offset
@@ -223,7 +242,9 @@ public final class SFTPFileSystem: RemoteFS, @unchecked Sendable {
         let sp = serverPath(file)
         do {
             try await withTimeout {
-                try await self.connection.withSFTP { sftp in
+                // set-size is idempotent (setting the same size twice is a no-op)
+                // → safe to retry on a dropped transport.
+                try await self.connection.withSFTP(retryOnDrop: true) { sftp in
                     // SFTP v3 truncate == setstat with just the size attribute.
                     try await sftp.setAttributes(at: sp, to: SFTPFileAttributes(size: size))
                 }

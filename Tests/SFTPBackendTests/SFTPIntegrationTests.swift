@@ -180,6 +180,10 @@ private func makeConnection() -> SFTPConnection {
 
     #expect(sink.errors.isEmpty, "concurrent ops threw: \(sink.errors)")
     #expect(sink.successes == count)
+    // Coalescing proof: despite `count` concurrent first-use callers, the
+    // single-flight path must have run SSHClient.connect exactly once (no
+    // redundant sessions, no orphaned clients).
+    #expect(conn.connectCount == 1, "expected 1 connect, got \(conn.connectCount)")
 
     await conn.close()
 }

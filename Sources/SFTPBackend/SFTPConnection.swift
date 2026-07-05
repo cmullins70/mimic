@@ -40,6 +40,10 @@ public final class SFTPConnection: @unchecked Sendable {
     /// In-flight connect, guarded by `lock`. Concurrent callers await the same
     /// `Task` instead of each starting a redundant `SSHClient.connect`.
     private var connectingTask: Task<SFTPClient, Error>?
+    /// Count of completed `SSHClient.connect` calls, guarded by `lock`. Exists so
+    /// tests can assert the single-flight path coalesces concurrent callers onto
+    /// ONE connect; not part of the public API.
+    private(set) var connectCount = 0
 
     public init(host: String, port: Int, username: String,
                 auth: SFTPAuth, hostKeyPolicy: HostKeyPolicy) {
@@ -135,6 +139,7 @@ public final class SFTPConnection: @unchecked Sendable {
             lock.withLock {
                 self.ssh = client
                 self.sftp = sftpClient
+                self.connectCount += 1
             }
             return sftpClient
         } catch let e as RemoteFSError {
@@ -180,17 +185,34 @@ public final class SFTPConnection: @unchecked Sendable {
 
     /// Run an SFTP operation against a live channel, connecting first if needed.
     ///
-    /// If the operation fails because the transport died (see `isConnectionDead`),
-    /// drop the client, reconnect ONCE, and retry the operation a single time. A
-    /// failure on the retry propagates unchanged. Non-transport errors are never
-    /// retried.
-    public func withSFTP<T: Sendable>(_ body: @Sendable (SFTPClient) async throws -> T) async throws -> T {
+    /// Retry contract: `retryOnDrop` MUST be set true ONLY for IDEMPOTENT ops.
+    /// When true, a dead-transport failure (see `isConnectionDead`) drops the
+    /// client, reconnects ONCE, and retries `body` a single time; a failure on the
+    /// retry propagates unchanged.
+    ///
+    /// Why mutating ops opt out: the drop can happen AFTER the server acked the op
+    /// but BEFORE we saw the response. Blindly re-running a non-idempotent op then
+    /// surfaces a spurious error — createFile (EXCL) → `alreadyExists` though the
+    /// file WAS created; rename/removeFile/removeDirectory → `notFound` though they
+    /// succeeded; createDirectory → `alreadyExists`. So those callers pass
+    /// `retryOnDrop: false` (the default): the dead-transport error propagates on
+    /// the first attempt, but the client is STILL dropped, so the NEXT call's
+    /// `liveOrConnect` reconnects — recovery still happens, we just don't blindly
+    /// re-run a mutating op. Idempotent ops (read, attributes, list,
+    /// offset-addressed write, set-size truncate) safely pass `retryOnDrop: true`.
+    public func withSFTP<T: Sendable>(
+        retryOnDrop: Bool = false,
+        _ body: @Sendable (SFTPClient) async throws -> T
+    ) async throws -> T {
         let client = try await liveOrConnect()
         do {
             return try await body(client)
         } catch {
             guard isConnectionDead(error) else { throw error }
+            // Always drop the dead client so the next call reconnects; only
+            // re-run the op in place when the caller opted in (idempotent op).
             dropClient()
+            guard retryOnDrop else { throw error }
             let fresh = try await liveOrConnect()
             return try await body(fresh)
         }
