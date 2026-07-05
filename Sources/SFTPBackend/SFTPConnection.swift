@@ -1,5 +1,6 @@
 import Foundation
 import Citadel
+import NIOCore
 import VFSCore
 
 public enum SFTPAuth: Sendable {
@@ -22,8 +23,10 @@ public enum HostKeyPolicy: Sendable {
 /// wrapper is `@unchecked Sendable`: the mutable client refs are guarded by
 /// `lock` (held only for synchronous get/set, never across `await`), and the
 /// actual SFTP I/O runs on Citadel's own thread-safe, `Sendable` `SFTPClient`.
-/// Callers drive one logical connection sequentially (the CLI and the
-/// integration tests do); concurrent first-use could open a redundant session.
+///
+/// Resilience: `withSFTP` reconnects once and retries if an operation fails
+/// because the transport died mid-flight; concurrent first-use is coalesced by a
+/// single-flight connect `Task` so redundant SSH sessions are never opened.
 public final class SFTPConnection: @unchecked Sendable {
     public let host: String
     public let port: Int
@@ -34,6 +37,13 @@ public final class SFTPConnection: @unchecked Sendable {
     private let lock = NSLock()
     private var ssh: SSHClient?
     private var sftp: SFTPClient?
+    /// In-flight connect, guarded by `lock`. Concurrent callers await the same
+    /// `Task` instead of each starting a redundant `SSHClient.connect`.
+    private var connectingTask: Task<SFTPClient, Error>?
+    /// Count of completed `SSHClient.connect` calls, guarded by `lock`. Exists so
+    /// tests can assert the single-flight path coalesces concurrent callers onto
+    /// ONE connect; not part of the public API.
+    private(set) var connectCount = 0
 
     public init(host: String, port: Int, username: String,
                 auth: SFTPAuth, hostKeyPolicy: HostKeyPolicy) {
@@ -76,6 +86,47 @@ public final class SFTPConnection: @unchecked Sendable {
         }
     }
 
+    /// Clear the current client refs under the lock so the next call reconnects.
+    /// Does NOT close the channel (the transport is presumed already dead); use
+    /// `invalidate()` for a best-effort close of a possibly-wedged client.
+    private func dropClient() {
+        lock.withLock {
+            ssh = nil
+            sftp = nil
+        }
+    }
+
+    /// Whether `error` indicates the transport died and a reconnect is warranted.
+    ///
+    /// Reconnect is gated on THIS classification (a dead transport) — never on a
+    /// real/non-transient failure. We key off the error CASE, not `.posixErrno`:
+    /// `.connectionLost` and `.io` both map to EIO, so errno cannot distinguish a
+    /// dead socket (retry) from a genuine I/O error (don't). The body of a
+    /// `withSFTP` op throws RAW Citadel/NIO errors (it hasn't been through
+    /// `SFTPFileSystem.mapError` yet), so we must recognize those raw types here:
+    ///   - `SFTPError.connectionClosed` — every in-flight request promise is
+    ///     failed with this when the SFTP channel closes (`SFTPResponses.close`).
+    ///     This is the actual error a mid-op drop surfaces.
+    ///   - NIO `ChannelError.ioOnClosedChannel/.alreadyClosed/.eof` — a write to
+    ///     an already-dead channel.
+    ///   - `RemoteFSError.connectionLost` — in case a mapped error reaches here
+    ///     (e.g. an SFTP status of connectionLost/noConnection).
+    /// Everything else (auth, permission, notFound, unsupported, hostKeyMismatch,
+    /// timeout, alreadyExists, isADirectory, notADirectory, directoryNotEmpty,
+    /// io, and any SFTP `errorStatus`) is a real or non-transient failure and is
+    /// deliberately NOT retried.
+    private func isConnectionDead(_ error: Error) -> Bool {
+        if case RemoteFSError.connectionLost = error { return true }
+        if case SFTPError.connectionClosed = error { return true }
+        if let ce = error as? ChannelError {
+            switch ce {
+            case .ioOnClosedChannel, .alreadyClosed, .eof: return true
+            default: return false
+            }
+        }
+        return false
+    }
+
     private func connect() async throws -> SFTPClient {
         do {
             let client = try await SSHClient.connect(
@@ -88,6 +139,7 @@ public final class SFTPConnection: @unchecked Sendable {
             lock.withLock {
                 self.ssh = client
                 self.sftp = sftpClient
+                self.connectCount += 1
             }
             return sftpClient
         } catch let e as RemoteFSError {
@@ -97,21 +149,94 @@ public final class SFTPConnection: @unchecked Sendable {
             // mapping (EACCES vs EIO) and any UI message are meaningful.
             let text = String(describing: error).lowercased()
             if text.contains("auth") || text.contains("password") || text.contains("permission") {
-                throw RemoteFSError.authenticationFailed(String(describing: error))
+                // Credential hygiene: the raw Citadel/NIOSSH error is DELIBERATELY
+                // NOT included in the message. On the auth path that underlying
+                // error could embed the attempted password (or other credential
+                // material), so we surface a fixed, non-error-derived string. Do
+                // not change this to interpolate `error` — it would risk leaking a
+                // credential into logs/UI.
+                throw RemoteFSError.authenticationFailed("SSH authentication rejected by server")
             }
             throw RemoteFSError.connectionLost
         }
     }
 
-    /// Run an SFTP operation against a live channel, connecting first if needed.
-    public func withSFTP<T: Sendable>(_ body: @Sendable (SFTPClient) async throws -> T) async throws -> T {
-        let client: SFTPClient
-        if let existing = liveSFTP() {
-            client = existing
-        } else {
-            client = try await connect()
+    /// Return the live SFTP client, or establish one — coalescing concurrent
+    /// callers onto a single in-flight connect so we never open a redundant
+    /// SSH session or orphan a client. The lock is released before awaiting the
+    /// Task (never held across `await`).
+    private func liveOrConnect() async throws -> SFTPClient {
+        if let live = liveSFTP() { return live }
+        let task: Task<SFTPClient, Error> = lock.withLock {
+            if let existing = connectingTask { return existing }
+            let t = Task { try await self.connect() }
+            connectingTask = t
+            return t
         }
-        return try await body(client)
+        do {
+            let client = try await task.value
+            lock.withLock { if connectingTask == task { connectingTask = nil } }
+            return client
+        } catch {
+            lock.withLock { if connectingTask == task { connectingTask = nil } }
+            throw error
+        }
+    }
+
+    /// Run an SFTP operation against a live channel, connecting first if needed.
+    ///
+    /// Retry contract: `retryOnDrop` MUST be set true ONLY for IDEMPOTENT ops.
+    /// When true, a dead-transport failure (see `isConnectionDead`) drops the
+    /// client, reconnects ONCE, and retries `body` a single time; a failure on the
+    /// retry propagates unchanged.
+    ///
+    /// Why mutating ops opt out: the drop can happen AFTER the server acked the op
+    /// but BEFORE we saw the response. Blindly re-running a non-idempotent op then
+    /// surfaces a spurious error — createFile (EXCL) → `alreadyExists` though the
+    /// file WAS created; rename/removeFile/removeDirectory → `notFound` though they
+    /// succeeded; createDirectory → `alreadyExists`. So those callers pass
+    /// `retryOnDrop: false` (the default): the dead-transport error propagates on
+    /// the first attempt, but the client is STILL dropped, so the NEXT call's
+    /// `liveOrConnect` reconnects — recovery still happens, we just don't blindly
+    /// re-run a mutating op. Idempotent ops (read, attributes, list,
+    /// offset-addressed write, set-size truncate) safely pass `retryOnDrop: true`.
+    public func withSFTP<T: Sendable>(
+        retryOnDrop: Bool = false,
+        _ body: @Sendable (SFTPClient) async throws -> T
+    ) async throws -> T {
+        let client = try await liveOrConnect()
+        do {
+            return try await body(client)
+        } catch {
+            guard isConnectionDead(error) else { throw error }
+            // Always drop the dead client so the next call reconnects; only
+            // re-run the op in place when the caller opted in (idempotent op).
+            dropClient()
+            guard retryOnDrop else { throw error }
+            let fresh = try await liveOrConnect()
+            return try await body(fresh)
+        }
+    }
+
+    /// Best-effort teardown of the current client so the next call reconnects.
+    ///
+    /// Used when a caller (e.g. `SFTPFileSystem` on `RemoteFSError.timeout`)
+    /// suspects the connection is wedged. Citadel/NIOSSH calls may not observe
+    /// Swift Task cancellation, so a `withTimeout` that fires does NOT guarantee
+    /// the underlying SFTP request stopped — leaving a possibly-half-wedged
+    /// client that `liveSFTP()` would otherwise happily reuse. Proactively drop
+    /// (and try to close) it here so a wedged connection is never silently reused.
+    public func invalidate() async {
+        let s: SSHClient?
+        let f: SFTPClient?
+        (s, f) = lock.withLock {
+            let pair = (ssh, sftp)
+            ssh = nil
+            sftp = nil
+            return pair
+        }
+        try? await f?.close()
+        try? await s?.close()
     }
 
     public func close() async {

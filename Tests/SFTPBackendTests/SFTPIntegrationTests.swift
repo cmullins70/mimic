@@ -19,6 +19,16 @@ private func makeFS() async throws -> SFTPFileSystem {
         root: "/upload")
 }
 
+// Bare connection (not yet established) for exercising the resilience layer
+// directly: reconnect-after-invalidate and single-flight concurrent connect.
+private func makeConnection() -> SFTPConnection {
+    let host = ProcessInfo.processInfo.environment["MIMIC_SFTP_TEST_HOST"]!
+    return SFTPConnection(
+        host: host, port: 2222, username: "mimic",
+        auth: .password("mimictest"),
+        hostKeyPolicy: .acceptAny)   // test fixture only
+}
+
 @Test(.enabled(if: enabled)) func fullFileLifecycle() async throws {
     let fs = try await makeFS()
     let p = try RemotePath("/it-\(UUID().uuidString).txt")
@@ -113,4 +123,67 @@ private func makeFS() async throws -> SFTPFileSystem {
     try store.replacePin(host: host, port: 2222,
                          fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
     await #expect(throws: RemoteFSError.self) { _ = try await connectTOFU() }
+}
+
+// Resilience: after the client is forcibly torn down (simulating the server
+// dropping the connection / a wedged-then-invalidated client), the very next
+// operation transparently re-establishes via liveOrConnect and succeeds. Proves
+// SFTPConnection recovers a dead connection without the caller reconnecting.
+@Test(.enabled(if: enabled)) func reconnectAfterInvalidateSFTPIntegration() async throws {
+    let conn = makeConnection()
+
+    // First op establishes the connection and works.
+    let realpath1 = try await conn.withSFTP { try await $0.getRealPath(atPath: ".") }
+    #expect(!realpath1.isEmpty)
+
+    // Kill the live client the way a dropped/wedged connection would leave it.
+    await conn.invalidate()
+
+    // Next op must transparently reconnect and succeed — no error surfaces.
+    let realpath2 = try await conn.withSFTP { try await $0.getRealPath(atPath: ".") }
+    #expect(!realpath2.isEmpty)
+
+    await conn.close()
+}
+
+// Single-flight: fire many concurrent operations against a freshly-made
+// connection whose transport is NOT yet established. All callers must coalesce
+// onto one connect (no redundant SSH sessions, no orphaned clients) and every
+// op must succeed. Exercises the liveOrConnect single-flight path directly.
+@Test(.enabled(if: enabled)) func concurrentOpsSingleFlightSFTPIntegration() async throws {
+    let conn = makeConnection()
+
+    // Reference-type sink so concurrent tasks can record failures under a lock
+    // (Swift 6 strict concurrency), mirroring SecretStoreTests' ErrorSink.
+    final class ErrorSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var errors: [Error] = []
+        private(set) var successes = 0
+        func record(_ error: Error) { lock.withLock { errors.append(error) } }
+        func succeed() { lock.withLock { successes += 1 } }
+    }
+    let sink = ErrorSink()
+    let count = 20
+
+    await withTaskGroup(of: Void.self) { group in
+        for _ in 0..<count {
+            group.addTask {
+                do {
+                    _ = try await conn.withSFTP { try await $0.getRealPath(atPath: ".") }
+                    sink.succeed()
+                } catch {
+                    sink.record(error)
+                }
+            }
+        }
+    }
+
+    #expect(sink.errors.isEmpty, "concurrent ops threw: \(sink.errors)")
+    #expect(sink.successes == count)
+    // Coalescing proof: despite `count` concurrent first-use callers, the
+    // single-flight path must have run SSHClient.connect exactly once (no
+    // redundant sessions, no orphaned clients).
+    #expect(conn.connectCount == 1, "expected 1 connect, got \(conn.connectCount)")
+
+    await conn.close()
 }
