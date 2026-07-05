@@ -27,3 +27,7 @@ updates:
     # by this ignore and still surface separately.)
     ignore:
       - dependency-name: "github.com/orlandos-nl/citadel"
+      # The swift-nio-ssh maintainer fork (now a direct dep so we can name its
+      # host-key types). Same posture as Citadel: any bump needs a manual
+      # supply-chain review of the fork, not an auto-PR.
+      - dependency-name: "github.com/joannis/swift-nio-ssh"
